@@ -7,3 +7,5 @@ ViT H-14 is better but needs to be converted to tensorrt+8bitQuant or onnx+quant
 * [https://platform.sankuai.com/foodai2021.html#index](https://platform.sankuai.com/foodai2021.html#index)
 * [https://github.com/mlfoundations/open_clip](https://github.com/mlfoundations/open_clip)
 * [https://github.com/mlfoundations/wise-ft](https://github.com/mlfoundations/wise-ft)
+* Lion optimizer [https://arxiv.org/pdf/2302.06675.pdf](https://arxiv.org/pdf/2302.06675.pdf)
+* [https://github.com/psinger/kaggle-landmark-recognition-2020-1st-place](https://github.com/psinger/kaggle-landmark-recognition-2020-1st-place)
