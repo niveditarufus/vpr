@@ -18,16 +18,16 @@ from transformers import get_cosine_schedule_with_warmup
 
 
 class config:
-    name = "vit_224_v3"
+    name = "vit_224_v4"
     root_dir = r"/home/nick/Data"
-    lr_model = 1e-6
+    lr_model = 5e-6
     lr_fc = 1e-4
     weight_decay = 1e-5
     epochs = 25
     batch_size = 64
     img_size = 224
-    scheduler = 'cos' # could be 'cos' or 'step'
-    warmup_epochs = 1
+    scheduler = "cos"  # could be 'cos' or 'step'
+    warmup_epochs = 0.5
     num_workers = 12
     num_classes = 9691
     embedding_size = 768
@@ -205,9 +205,7 @@ class VPRModule(pl.LightningModule):
         super().__init__()
         # Exports the hyperparameters to a YAML file, and create "self.hparams" namespace
         # self.save_hyperparameters()
-        # Create model
         self.model = Classifier_model()
-        # Create loss module
         self.loss_module = nn.CrossEntropyLoss()
         self.num_train_steps = num_train_steps
         # Example input for visualizing the graph in Tensorboard
@@ -220,23 +218,26 @@ class VPRModule(pl.LightningModule):
         return self.model(img, labels)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
+        self.optimizer = torch.optim.AdamW(
             [
                 {"params": self.model.model.parameters(), "lr": config.lr_model},
                 {"params": self.model.fc.parameters(), "lr": config.lr_fc},
             ],
             weight_decay=config.weight_decay,
         )
-        if config.scheduler == 'cos':
-            scheduler = get_cosine_schedule_with_warmup(optimizer,
-                                                         num_warmup_steps=self.num_train_steps * config.warmup_epochs,
-                                                         num_training_steps=int(
-                                                             self.num_train_steps * config.epochs))
-        else:
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                optimizer, milestones=[config.epochs-5, config.epochs-1], gamma=0.1
+        if config.scheduler == "cos":
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=int(self.num_train_steps * config.warmup_epochs),
+                num_training_steps=int(self.num_train_steps * config.epochs),
             )
-        return [optimizer], [scheduler]
+        else:
+            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                self.optimizer,
+                milestones=[config.epochs - 5, config.epochs - 1],
+                gamma=0.1,
+            )
+        return [self.optimizer]
 
     def training_step(self, batch, batch_idx):
         # "batch" is the output of the training data loader.
@@ -247,6 +248,18 @@ class VPRModule(pl.LightningModule):
         # Logs the accuracy per epoch to tensorboard (weighted average over batches)
         self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=False)
+
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            self.log(
+                f"lr/lr{i}",
+                param_group["lr"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+        if config.scheduler == "cos":
+            self.scheduler.step()
         return loss  # Return tensor to call ".backward" on
 
     def validation_step(self, batch, batch_idx):
@@ -274,10 +287,9 @@ def main():
         mode="max",
         every_n_epochs=1,
         monitor="val_acc",
-        save_last=True,
         save_weights_only=True,
     )
-    model = VPRModule(len(train_dataset) // config.batch_size)
+    model = VPRModule(num_train_steps=len(train_dataset) // config.batch_size)
     trainer = pl.Trainer(
         max_epochs=config.epochs,
         accelerator="gpu",
