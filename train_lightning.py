@@ -12,22 +12,24 @@ import torchvision as tv
 import yaml
 from PIL import Image
 from pytorch_lightning.callbacks import ModelCheckpoint
+from timm import optim
 from torch import linalg
 from torch.nn import functional as F
 from transformers import get_cosine_schedule_with_warmup
 
 
 class config:
-    name = "vit_224_v4"
+    name = "vit_224_v5"
     root_dir = r"/home/nick/Data"
-    lr_model = 5e-6
+    lr_model = 2e-7
     lr_fc = 1e-4
-    weight_decay = 1e-5
+    weight_decay = 1e-2
     epochs = 25
+    warmup_epochs = 1
+    model_freeze_epochs = 0
     batch_size = 64
     img_size = 224
     scheduler = "cos"  # could be 'cos' or 'step'
-    warmup_epochs = 0.5
     num_workers = 12
     num_classes = 9691
     embedding_size = 768
@@ -37,6 +39,7 @@ class config:
 def get_train_aug():
     train_augs = tv.transforms.Compose(
         [
+            # tv.transforms.Resize((1.2*config.img_size, 1.2*config.img_size)),
             tv.transforms.RandomResizedCrop((config.img_size, config.img_size)),
             tv.transforms.RandomHorizontalFlip(),
             tv.transforms.ToTensor(),
@@ -225,6 +228,13 @@ class VPRModule(pl.LightningModule):
             ],
             weight_decay=config.weight_decay,
         )
+        # self.optimizer = optim.lion.Lion(
+        #    [
+        #        {"params": self.model.model.parameters(), "lr": config.lr_model},
+        #        {"params": self.model.fc.parameters(), "lr": config.lr_fc},
+        #    ],
+        #    weight_decay=config.weight_decay,
+        # )
         if config.scheduler == "cos":
             self.scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
@@ -241,6 +251,14 @@ class VPRModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # "batch" is the output of the training data loader.
+
+        if self.current_epoch < config.model_freeze_epochs:
+            for param in self.model.model.parameters():
+                param.requires_grad = False
+        else:
+            for param in self.model.model.parameters():
+                param.requires_grad = True
+
         img, labels = batch
         preds = self.model(img, labels)
         loss = self.loss_module(preds, labels)
