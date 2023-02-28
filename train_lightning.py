@@ -1,6 +1,8 @@
 import math
 import os
+from copy import deepcopy
 
+import albumentations as A
 import cv2
 import open_clip
 import pandas as pd
@@ -19,13 +21,15 @@ from transformers import get_cosine_schedule_with_warmup
 
 
 class config:
-    name = "vit_224_v5"
+    name = "vit_224_v3"
     root_dir = r"/home/nick/Data"
+    num_models_save = 20
     lr_model = 2e-7
     lr_fc = 1e-4
     weight_decay = 1e-2
     epochs = 25
     warmup_epochs = 1
+    # start_ema_epoch = 5
     model_freeze_epochs = 0
     batch_size = 64
     img_size = 224
@@ -39,9 +43,20 @@ class config:
 def get_train_aug():
     train_augs = tv.transforms.Compose(
         [
-            # tv.transforms.Resize((1.2*config.img_size, 1.2*config.img_size)),
-            tv.transforms.RandomResizedCrop((config.img_size, config.img_size)),
+            tv.transforms.Resize((config.img_size, config.img_size)),
+            # tv.transforms.RandomResizedCrop((config.img_size, config.img_size)),
+            tv.transforms.RandomVerticalFlip(),
             tv.transforms.RandomHorizontalFlip(),
+            tv.transforms.RandomApply(
+                [tv.transforms.RandomRotation(degrees=90)], p=0.3
+            ),
+            tv.transforms.RandomApply(
+                [
+                    tv.transforms.ColorJitter(brightness=0.2, hue=0.3),
+                ],
+                p=0.2,
+            ),
+            # tv.transforms.RandomApply([tv.transforms.RandAugment()], p=0.3),
             tv.transforms.ToTensor(),
             tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ]
@@ -203,21 +218,44 @@ class Classifier_model(nn.Module):
         return x
 
 
+class ModelEmaV2(torch.nn.Module):
+    def __init__(self, model, decay=0.9995, device=None):
+        super(ModelEmaV2, self).__init__()
+        # make a copy of the model for accumulating moving average of weights
+        self.module = deepcopy(model)
+        self.module.eval()
+        self.decay = decay
+        self.device = device  # perform ema on different device from model if set
+        if self.device is not None:
+            self.module.to(device=device)
+
+    def _update(self, model, update_fn):
+        with torch.no_grad():
+            for ema_v, model_v in zip(
+                self.module.state_dict().values(), model.state_dict().values()
+            ):
+                if self.device is not None:
+                    model_v = model_v.to(device=self.device)
+                ema_v.copy_(update_fn(ema_v, model_v))
+
+    def update(self, model):
+        self._update(
+            model, update_fn=lambda e, m: self.decay * e + (1.0 - self.decay) * m
+        )
+
+    def set(self, model):
+        self._update(model, update_fn=lambda e, m: m)
+
+
 class VPRModule(pl.LightningModule):
     def __init__(self, num_train_steps):
         super().__init__()
-        # Exports the hyperparameters to a YAML file, and create "self.hparams" namespace
-        # self.save_hyperparameters()
         self.model = Classifier_model()
+        # self.model_ema = ''
         self.loss_module = nn.CrossEntropyLoss()
         self.num_train_steps = num_train_steps
-        # Example input for visualizing the graph in Tensorboard
-
-    #         self.sample_input = torch.zeros((1, 3, 224, 224), dtype=torch.float32)
-    #         self.example_input_array = [self.sample_input, self.sample_input]
 
     def forward(self, img, labels):
-        # Forward function that is run when visualizing the graph
         return self.model(img, labels)
 
     def configure_optimizers(self):
@@ -289,6 +327,14 @@ class VPRModule(pl.LightningModule):
         self.log("val_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
         self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=False)
 
+    # def optimizer_step(self, epoch, batch_nb, optimizer, optimizer_idx, closure, on_tpu=False,
+    #                   using_native_amp=False, using_lbfgs=False):
+    #    optimizer.step(closure=closure)
+    #    if epoch >= config.start_ema_epoch:
+    #        if self.model_ema == '':
+    #            self.model_ema = ModelEmaV2(self.model)
+    #        self.model_ema.update(self.model)
+
 
 def main():
     config_dict = config.__dict__
@@ -303,6 +349,7 @@ def main():
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(config.root_dir, "model_saves", config.name),
         mode="max",
+        save_top_k=config.num_models_save,
         every_n_epochs=1,
         monitor="val_acc",
         save_weights_only=True,
