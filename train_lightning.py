@@ -21,23 +21,30 @@ from transformers import get_cosine_schedule_with_warmup
 
 
 class config:
-    name = "vit_224_v3"
+    name = "vit_224_v4_H"
     root_dir = r"/home/nick/Data"
-    num_models_save = 20
+    num_models_save = 10
     lr_model = 2e-7
-    lr_fc = 1e-4
+    lr_fc = 2e-4
     weight_decay = 1e-2
-    epochs = 25
+    epochs = 10
     warmup_epochs = 1
     # start_ema_epoch = 5
     model_freeze_epochs = 0
-    batch_size = 64
+    dynamic_margin = True
+    m = 0.3
+    s = 30
+    stride = 0.05
+    max_m = 0.8
+    batch_size = 32
     img_size = 224
     scheduler = "cos"  # could be 'cos' or 'step'
+    model_name = "ViT-H-14"
     num_workers = 12
     num_classes = 9691
-    embedding_size = 768
+    embedding_size = 1024  # 768
     precision = 16
+    use_val = False
 
 
 def get_train_aug():
@@ -182,13 +189,23 @@ def get_dataloaders():
 
 
 class ArcFace(nn.Module):
-    def __init__(self, cin, cout, s=30, m=0.3):
+    def __init__(self, cin, cout, s=30, m=0.3, stride=0.1, max_m=0.8):
         super().__init__()
+        self.m = m
         self.s = s
-        self.sin_m = torch.sin(torch.tensor(m))
-        self.cos_m = torch.cos(torch.tensor(m))
+        self.sin_m = torch.sin(torch.tensor(self.m))
+        self.cos_m = torch.cos(torch.tensor(self.m))
         self.cout = cout
         self.fc = nn.Linear(cin, cout, bias=False)
+        self.last_epoch = 0
+        self.max_m = max_m
+        self.m_s = stride
+
+    def update(self, c_epoch):
+        self.m = min(self.m + self.m_s * (c_epoch - self.last_epoch), self.max_m)
+        self.last_epoch = c_epoch
+        self.sin_m = torch.sin(torch.tensor(self.m))
+        self.cos_m = torch.cos(torch.tensor(self.m))
 
     def forward(self, x, label=None):
         w_L2 = linalg.norm(self.fc.weight.detach(), dim=1, keepdim=True).T
@@ -208,9 +225,16 @@ class Classifier_model(nn.Module):
     def __init__(self):
         super(Classifier_model, self).__init__()
         self.model = open_clip.create_model_and_transforms(
-            "ViT-L-14", pretrained="laion2b_s32b_b82k"
+            config.model_name, pretrained="laion2b_s32b_b79k"
         )[0].visual
-        self.fc = ArcFace(config.embedding_size, config.num_classes)
+        self.fc = ArcFace(
+            config.embedding_size,
+            config.num_classes,
+            s=config.s,
+            m=config.m,
+            stride=config.stride,
+            max_m=config.max_m,
+        )
 
     def forward(self, x, labels=None):
         x = self.model(x)
@@ -316,6 +340,10 @@ class VPRModule(pl.LightningModule):
 
         if config.scheduler == "cos":
             self.scheduler.step()
+
+        if config.dynamic_margin:
+            self.model.fc.update(self.current_epoch)
+
         return loss  # Return tensor to call ".backward" on
 
     def validation_step(self, batch, batch_idx):
@@ -346,12 +374,18 @@ def main():
         yaml.dump(config_dict, file)
 
     train_loader, val_loader, train_dataset = get_dataloaders()
+
+    if config.use_val:
+        monitor = "val_acc"
+    else:
+        monitor = "train_acc"
+
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(config.root_dir, "model_saves", config.name),
         mode="max",
         save_top_k=config.num_models_save,
         every_n_epochs=1,
-        monitor="val_acc",
+        monitor=monitor,
         save_weights_only=True,
     )
     model = VPRModule(num_train_steps=len(train_dataset) // config.batch_size)
@@ -364,7 +398,11 @@ def main():
             save_dir=os.path.join(config.root_dir, "model_saves", config.name)
         ),
     )
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+    if config.use_val:
+        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    else:
+        trainer.fit(model, train_dataloaders=train_loader)
 
 
 if __name__ == "__main__":
