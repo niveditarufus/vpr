@@ -8,3 +8,6 @@ PyYAML==6.0
 scikit-learn==1.0.2
 scipy==1.7.3
 open_clip_torch
+albumentations
+pytorch-lightning
+transformers
