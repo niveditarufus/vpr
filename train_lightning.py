@@ -21,8 +21,16 @@ from transformers import get_cosine_schedule_with_warmup
 
 
 class config:
-    name = "vit_224_v4_H"
-    root_dir = r"/home/nick/Data"
+    name = "vit_224_v1"
+    root_dir = r"/home/nick/Data/"  # could be '/home/nick/Data/' or '/mnt/data/nick/'
+    csv_file_tr = (
+        "train.csv"  # could be 'train.csv' or 'final_data_224/final_data_224.csv'
+    )
+    csv_file_tt = (
+        "test.csv"  # could be 'test.csv' or 'final_data_224/final_data_224.csv'
+    )
+    dataset = "Product10KDataset"  # could be 'BigDataset' or 'Product10KDataset'
+
     num_models_save = 10
     lr_model = 2e-7
     lr_fc = 2e-4
@@ -41,10 +49,12 @@ class config:
     scheduler = "cos"  # could be 'cos' or 'step'
     model_name = "ViT-H-14"
     num_workers = 12
-    num_classes = 9691
+    num_classes = 9691  # could be '14087' or '9691'
     embedding_size = 1024  # 768
     precision = 16
     use_val = False
+    optimizer = "AdamW"  # could be 'lion' or 'AdamW'
+    loss = "CE"  # could be 'CE' or 'LabelSmoothing'
 
 
 def get_train_aug():
@@ -127,26 +137,30 @@ class Product10KDataset(data.Dataset):
         return len(self.imlist)
 
 
-class SubmissionDataset(data.Dataset):
-    def __init__(self, root, annotation_file, transforms, with_bbox=False):
+class BigDataset(data.Dataset):
+    def __init__(self, root, annotation_file, transforms, is_inference=False):
         self.root = root
         self.imlist = pd.read_csv(annotation_file)
         self.transforms = transforms
-        self.with_bbox = with_bbox
+        self.is_inference = is_inference
 
     def __getitem__(self, index):
         cv2.setNumThreads(6)
+        if self.is_inference:
+            impath, _ = self.imlist.iloc[index]
+        else:
+            impath, target = self.imlist.iloc[index]
 
-        full_imname = os.path.join(self.root, self.imlist["img_path"][index])
+        full_imname = os.path.join(self.root, impath)
         img = read_image(full_imname)
-
-        if self.with_bbox:
-            x, y, w, h = self.imlist.loc[index, "bbox_x":"bbox_h"]
-            img = img[y : y + h, x : x + w, :]
 
         img = Image.fromarray(img)
         img = self.transforms(img)
-        return img
+
+        if self.is_inference:
+            return img
+        else:
+            return img, target
 
     def __len__(self):
         return len(self.imlist)
@@ -154,11 +168,18 @@ class SubmissionDataset(data.Dataset):
 
 def get_dataloaders():
     print("Preparing train reader...")
-    train_dataset = Product10KDataset(
-        root=os.path.join(config.root_dir, "train"),
-        annotation_file=os.path.join(config.root_dir, "train.csv"),
-        transforms=get_train_aug(),
-    )
+    if config.dataset == "BigDataset":
+        train_dataset = BigDataset(
+            root=os.path.join(config.root_dir),
+            annotation_file=os.path.join(config.root_dir, config.csv_file_tr),
+            transforms=get_train_aug(),
+        )
+    elif config.dataset == "Product10KDataset":
+        train_dataset = Product10KDataset(
+            root=os.path.join(config.root_dir, "train"),
+            annotation_file=os.path.join(config.root_dir, config.csv_file_tr),
+            transforms=get_train_aug(),
+        )
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -170,11 +191,18 @@ def get_dataloaders():
     print("Done.")
 
     print("Preparing valid reader...")
-    val_dataset = Product10KDataset(
-        root=os.path.join(config.root_dir, "test"),
-        annotation_file=os.path.join(config.root_dir, "test.csv"),
-        transforms=get_val_aug(),
-    )
+    if config.dataset == "BigDataset":
+        val_dataset = BigDataset(
+            root=os.path.join(config.root_dir),
+            annotation_file=os.path.join(config.root_dir, config.csv_file_tt),
+            transforms=get_val_aug(),
+        )
+    elif config.dataset == "Product10KDataset":
+        val_dataset = Product10KDataset(
+            root=os.path.join(config.root_dir, "test"),
+            annotation_file=os.path.join(config.root_dir, config.csv_file_tt),
+            transforms=get_val_aug(),
+        )
     valid_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=config.batch_size,
@@ -271,32 +299,52 @@ class ModelEmaV2(torch.nn.Module):
         self._update(model, update_fn=lambda e, m: m)
 
 
+class LabelSmoothingCrossEntropy(nn.Module):
+    def __init__(self, smoothing=0.1):
+        super(LabelSmoothingCrossEntropy, self).__init__()
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+
+    def forward(self, x, target):
+        logprobs = torch.nn.functional.log_softmax(x, dim=-1)
+        nll_loss = -logprobs.gather(dim=-1, index=target.unsqueeze(1))
+        nll_loss = nll_loss.squeeze(1)
+        smooth_loss = -logprobs.mean(dim=-1)
+        loss = self.confidence * nll_loss + self.smoothing * smooth_loss
+        return loss.mean()
+
+
 class VPRModule(pl.LightningModule):
     def __init__(self, num_train_steps):
         super().__init__()
         self.model = Classifier_model()
         # self.model_ema = ''
-        self.loss_module = nn.CrossEntropyLoss()
+        if config.loss == "CE":
+            self.loss_module = nn.CrossEntropyLoss()
+        elif config.loss == "LabelSmoothing":
+            self.loss_module = LabelSmoothingCrossEntropy()
         self.num_train_steps = num_train_steps
 
     def forward(self, img, labels):
         return self.model(img, labels)
 
     def configure_optimizers(self):
-        self.optimizer = torch.optim.AdamW(
-            [
-                {"params": self.model.model.parameters(), "lr": config.lr_model},
-                {"params": self.model.fc.parameters(), "lr": config.lr_fc},
-            ],
-            weight_decay=config.weight_decay,
-        )
-        # self.optimizer = optim.lion.Lion(
-        #    [
-        #        {"params": self.model.model.parameters(), "lr": config.lr_model},
-        #        {"params": self.model.fc.parameters(), "lr": config.lr_fc},
-        #    ],
-        #    weight_decay=config.weight_decay,
-        # )
+        if config.optimizer == "lion":
+            self.optimizer = optim.lion.Lion(
+                [
+                    {"params": self.model.model.parameters(), "lr": config.lr_model},
+                    {"params": self.model.fc.parameters(), "lr": config.lr_fc},
+                ],
+                weight_decay=config.weight_decay,
+            )
+        elif config.optimizer == "AdamW":
+            self.optimizer = torch.optim.AdamW(
+                [
+                    {"params": self.model.model.parameters(), "lr": config.lr_model},
+                    {"params": self.model.fc.parameters(), "lr": config.lr_fc},
+                ],
+                weight_decay=config.weight_decay,
+            )
         if config.scheduler == "cos":
             self.scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
@@ -320,6 +368,8 @@ class VPRModule(pl.LightningModule):
         else:
             for param in self.model.model.parameters():
                 param.requires_grad = True
+            # for param in self.model.fc.parameters():
+            #    param.requires_grad = False
 
         img, labels = batch
         preds = self.model(img, labels)
