@@ -1,5 +1,6 @@
 import math
 import os
+from collections import OrderedDict
 from copy import deepcopy
 
 import albumentations as A
@@ -21,7 +22,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 
 class config:
-    name = "vit_224_v1"
+    name = "vit_224_v8"
     root_dir = r"/home/nick/Data/"  # could be '/home/nick/Data/' or '/mnt/data/nick/'
     csv_file_tr = (
         "train.csv"  # could be 'train.csv' or 'final_data_224/final_data_224.csv'
@@ -39,6 +40,8 @@ class config:
     warmup_epochs = 1
     # start_ema_epoch = 5
     model_freeze_epochs = 0
+    start_model_path = ""
+    augmentation = True
     dynamic_margin = True
     m = 0.3
     s = 30
@@ -58,26 +61,38 @@ class config:
 
 
 def get_train_aug():
-    train_augs = tv.transforms.Compose(
-        [
-            tv.transforms.Resize((config.img_size, config.img_size)),
-            # tv.transforms.RandomResizedCrop((config.img_size, config.img_size)),
-            tv.transforms.RandomVerticalFlip(),
-            tv.transforms.RandomHorizontalFlip(),
-            tv.transforms.RandomApply(
-                [tv.transforms.RandomRotation(degrees=90)], p=0.3
-            ),
-            tv.transforms.RandomApply(
-                [
-                    tv.transforms.ColorJitter(brightness=0.2, hue=0.3),
-                ],
-                p=0.2,
-            ),
-            # tv.transforms.RandomApply([tv.transforms.RandAugment()], p=0.3),
-            tv.transforms.ToTensor(),
-            tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ]
-    )
+    if config.augmentation:
+        train_augs = tv.transforms.Compose(
+            [
+                tv.transforms.Resize((config.img_size, config.img_size)),
+                # tv.transforms.RandomResizedCrop((config.img_size, config.img_size)),
+                tv.transforms.RandomVerticalFlip(),
+                tv.transforms.RandomHorizontalFlip(),
+                tv.transforms.RandomApply(
+                    [tv.transforms.RandomRotation(degrees=90)], p=0.3
+                ),
+                tv.transforms.RandomApply(
+                    [
+                        tv.transforms.ColorJitter(brightness=0.2, hue=0.3),
+                    ],
+                    p=0.2,
+                ),
+                # tv.transforms.RandomApply([tv.transforms.RandAugment()], p=0.3),
+                tv.transforms.ToTensor(),
+                # tv.transforms.RandomErasing(p=0.3, scale=(0.05, 0.2), ratio=(0.3, 3.3)),
+                tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+    else:
+        train_augs = tv.transforms.Compose(
+            [
+                tv.transforms.Resize((config.img_size, config.img_size)),
+                tv.transforms.RandomVerticalFlip(),
+                tv.transforms.RandomHorizontalFlip(),
+                tv.transforms.ToTensor(),
+                tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
     return train_augs
 
 
@@ -249,12 +264,41 @@ class ArcFace(nn.Module):
         return cos
 
 
+class Neck(nn.Module):
+    def __init__(self, in_features, out_features, style="high_dim"):
+        super().__init__()
+        if style == "simple":
+            self.neck = nn.Sequential(
+                nn.Dropout(0.2),
+                nn.Linear(in_features, out_features),
+            )
+        elif style == "norm_double_linear":
+            self.neck = nn.Sequential(
+                nn.BatchNorm1d(in_features),
+                nn.Dropout(0.3),
+                nn.Linear(in_features, out_features * 2),
+                nn.Linear(out_features * 2, out_features),
+            )
+        elif style == "norm_single_linear":
+            self.neck = nn.Sequential(
+                nn.BatchNorm1d(in_features),
+                nn.Dropout(0.2),
+                nn.Linear(in_features, out_features),
+            )
+        else:
+            raise NotImplementedError(f"Unkown Neck: {stype}")
+
+    def forward(self, x):
+        return self.neck(x)
+
+
 class Classifier_model(nn.Module):
     def __init__(self):
         super(Classifier_model, self).__init__()
         self.model = open_clip.create_model_and_transforms(
             config.model_name, pretrained="laion2b_s32b_b79k"
         )[0].visual
+        # self.neck = Neck(config.embedding_size, config.embedding_size, 'norm_single_linear')
         self.fc = ArcFace(
             config.embedding_size,
             config.num_classes,
@@ -266,6 +310,7 @@ class Classifier_model(nn.Module):
 
     def forward(self, x, labels=None):
         x = self.model(x)
+        # x = self.neck(x)
         x = self.fc(x, labels)
         return x
 
@@ -318,6 +363,27 @@ class VPRModule(pl.LightningModule):
     def __init__(self, num_train_steps):
         super().__init__()
         self.model = Classifier_model()
+
+        if config.start_model_path != "":
+            try:
+                new_state_dict = torch.load(config.start_model_path)["model_state_dict"]
+            except:
+                state_dict_model = torch.load(config.start_model_path)["state_dict"]
+                new_state_dict = OrderedDict()
+                new_state_dict_fc = OrderedDict()
+                for k, v in state_dict_model.items():
+                    if "fc.fc" in k:
+                        name = k.replace("model.fc.", "")
+                        name = name.replace("fc.fc", "fc")
+                        new_state_dict_fc[name] = v
+                    else:
+                        name = k.replace("model.", "")
+                        # name = k.replace("module.backbone.net.", "")
+                        new_state_dict[name] = v
+
+            self.model.model.load_state_dict(new_state_dict)
+            self.model.fc.load_state_dict(new_state_dict_fc)
+
         # self.model_ema = ''
         if config.loss == "CE":
             self.loss_module = nn.CrossEntropyLoss()
@@ -342,6 +408,7 @@ class VPRModule(pl.LightningModule):
                 [
                     {"params": self.model.model.parameters(), "lr": config.lr_model},
                     {"params": self.model.fc.parameters(), "lr": config.lr_fc},
+                    # {"params": self.model.neck.parameters(), "lr": config.lr_fc},
                 ],
                 weight_decay=config.weight_decay,
             )
@@ -368,8 +435,10 @@ class VPRModule(pl.LightningModule):
         else:
             for param in self.model.model.parameters():
                 param.requires_grad = True
-            # for param in self.model.fc.parameters():
-            #    param.requires_grad = False
+
+        # if self.current_epoch > -1:
+        #    for param in self.model.fc.parameters():
+        #        param.requires_grad = False
 
         img, labels = batch
         preds = self.model(img, labels)

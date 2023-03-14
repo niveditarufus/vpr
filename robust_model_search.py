@@ -39,9 +39,11 @@ class classifier_model(nn.Module):
     def __init__(self):
         super(classifier_model, self).__init__()
         self.model = open_clip.create_model_and_transforms(
-            "ViT-L-14", pretrained="laion2b_s32b_b82k"
-        )[0].visual
-        self.fc = ArcFace(768, 9691)
+            "ViT-H-14", pretrained=False
+        )[
+            0
+        ].visual  # 'laion2b_s32b_b82k')[0].visual
+        self.fc = ArcFace(1024, 9691)
 
     def forward(self, x, labels=None):
         x = self.model(x)
@@ -75,14 +77,44 @@ def load_model(model_path):
     return theta_1, model_finetuned
 
 
+def load_model_full(model_path):
+    # load fine tuned
+    model_finetuned = classifier_model()
+
+    try:
+        new_state_dict = torch.load(model_path)["model_state_dict"]
+    except:
+        state_dict_model = torch.load(model_path)["state_dict"]
+        new_state_dict = OrderedDict()
+        new_state_dict_fc = OrderedDict()
+        for k, v in state_dict_model.items():
+            if "fc.fc" in k:
+                name = k.replace("model.fc.", "")
+                name = name.replace("fc.fc.weight", "fc.weight")
+                new_state_dict_fc[name] = v
+            else:
+                name = k.replace("model.", "")
+                # name = k.replace("module.backbone.net.", "")
+                new_state_dict[name] = v
+
+    model_finetuned.model.load_state_dict(new_state_dict)
+    model_finetuned.fc.load_state_dict(new_state_dict_fc)
+
+    model_finetuned.to("cuda")
+    # model_finetuned = model_finetuned.module.model
+
+    theta_1 = model_finetuned.state_dict()
+    return theta_1, model_finetuned
+
+
 def load_models(model_path):
     # load zero shot
     model_zeroshot, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-L-14", pretrained="laion2b_s32b_b82k"
-    )
+        "ViT-H-14", pretrained=False
+    )  #'laion2b_s32b_b82k')
     model_zeroshot = model_zeroshot.visual.to("cuda")
 
-    theta_1, model_finetuned = load_model(model_path)
+    theta_1, model_finetuned = load_model_full(model_path)
     theta_0 = model_zeroshot.state_dict()
 
     # make sure checkpoints are compatible
@@ -139,7 +171,7 @@ def mix_many_models():
         for alpha_combination in alpha_combinations
         if sum(alpha_combination) == 1.0
     ]
-    # alpha_combinations = [[0.0, 0.0, 0.6000000000000001, 0.4]]
+    # alpha_combinations = [[0.0, 0.9, 0.0, 0.1]]
     for i, alpha_combination in enumerate(alpha_combinations):
         print(f"Combination {i + 1} of {len(alpha_combinations)}")
         print(f"Alphas: {alpha_combination}")
@@ -148,7 +180,7 @@ def mix_many_models():
         theta = {}
         for j, model_path in enumerate(model_paths):
             alpha = alpha_combination[j]
-            theta_j, model_finetuned = load_model(model_path)
+            theta_j, model_finetuned = load_model_full(model_path)
 
             for key in theta_j.keys():
                 if key not in theta:
@@ -160,7 +192,7 @@ def mix_many_models():
         model_finetuned.load_state_dict(theta)
         torch.save(
             {
-                "model_state_dict": model_finetuned.state_dict(),
+                "state_dict": model_finetuned.state_dict(),
             },
             "./new_models/ViT-L-14-laion2B-s32B-b82K/interp_model.pth",
         )
