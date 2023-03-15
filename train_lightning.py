@@ -19,6 +19,7 @@ from timm import optim
 from torch import linalg
 from torch.nn import functional as F
 from transformers import get_cosine_schedule_with_warmup
+from vit_pytorch.distill import DistillableViT, DistillWrapper
 
 
 class config:
@@ -40,6 +41,7 @@ class config:
     warmup_epochs = 1
     # start_ema_epoch = 5
     model_freeze_epochs = 0
+    teacher_model_path = "/home/nick/Data/model_saves/epoch=7-step=17736.ckpt"
     start_model_path = ""
     augmentation = True
     dynamic_margin = True
@@ -50,13 +52,13 @@ class config:
     batch_size = 32
     img_size = 224
     scheduler = "cos"  # could be 'cos' or 'step'
-    model_name = "ViT-H-14"
+    model_name = "ViT-bigG-14"  # could be 'ViT-H-14' or 'ViT-bigG-14'
     num_workers = 12
-    num_classes = 9691  # could be '14087' or '9691'
-    embedding_size = 1024  # 768
+        num_classes = 9691  # could be '14087' or '9691'
+    embedding_size = 1280  # 1280 or 1024
     precision = 16
     use_val = False
-    optimizer = "AdamW"  # could be 'lion' or 'AdamW'
+    optimizer = "AdamW_st_tc"  # could be 'lion' or 'AdamW', 'AdamW_st_tc'
     loss = "CE"  # could be 'CE' or 'LabelSmoothing'
 
 
@@ -80,7 +82,9 @@ def get_train_aug():
                 # tv.transforms.RandomApply([tv.transforms.RandAugment()], p=0.3),
                 tv.transforms.ToTensor(),
                 # tv.transforms.RandomErasing(p=0.3, scale=(0.05, 0.2), ratio=(0.3, 3.3)),
-                tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                #tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                tv.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                        std=[0.26862954, 0.26130258, 0.27577711]),
             ]
         )
     else:
@@ -90,7 +94,9 @@ def get_train_aug():
                 tv.transforms.RandomVerticalFlip(),
                 tv.transforms.RandomHorizontalFlip(),
                 tv.transforms.ToTensor(),
-                tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                #tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                tv.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                        std=[0.26862954, 0.26130258, 0.27577711]),
             ]
         )
     return train_augs
@@ -295,8 +301,12 @@ class Neck(nn.Module):
 class Classifier_model(nn.Module):
     def __init__(self):
         super(Classifier_model, self).__init__()
+        if config.model_name == "ViT-H-14":
+            pretrained = "laion2b_s32b_b79k"
+        elif config.model_name == "ViT-bigG-14":
+            pretrained = "laion2b_s39b_b160k"
         self.model = open_clip.create_model_and_transforms(
-            config.model_name, pretrained="laion2b_s32b_b79k"
+            config.model_name, pretrained=pretrained
         )[0].visual
         # self.neck = Neck(config.embedding_size, config.embedding_size, 'norm_single_linear')
         self.fc = ArcFace(
@@ -359,10 +369,43 @@ class LabelSmoothingCrossEntropy(nn.Module):
         return loss.mean()
 
 
+def get_student_teacher_distiller():
+    teacher_model = Classifier_model()
+    state_dict_model = torch.load(config.teacher_model_path)['state_dict']
+    new_state_dict = OrderedDict()
+    for k, v in state_dict_model.items():
+        if 'model.' in k:
+            name = k.replace("model.", "", 1)
+        new_state_dict[name] = v
+    teacher_model.load_state_dict(new_state_dict)
+    student_model = DistillableViT(
+            image_size = 224,
+            patch_size = 14,
+            num_classes = config.num_classes,
+            dim = 1024,
+            depth = 32,
+            heads = 16,
+            mlp_dim = 5120,
+            dropout = 0.1,
+            emb_dropout = 0.1
+    )
+    distiller = DistillWrapper(
+        student = student_model,
+        teacher = teacher_model,
+        temperature = 3,           # temperature of distillation
+        alpha = 0.5,               # trade between main loss and distillation loss
+        hard = False               # whether to use soft or hard distillation
+    )
+    return distiller
+
+
 class VPRModule(pl.LightningModule):
     def __init__(self, num_train_steps):
         super().__init__()
-        self.model = Classifier_model()
+        if config.teacher_model_path != "":
+            self.model = get_student_teacher_distiller()
+        else:
+            self.model = Classifier_model()
 
         if config.start_model_path != "":
             try:
@@ -412,6 +455,12 @@ class VPRModule(pl.LightningModule):
                 ],
                 weight_decay=config.weight_decay,
             )
+        elif config.optimizer == "AdamW_st_tc":
+            self.optimizer = torch.optim.AdamW(
+                params=self.model.student.parameters(),
+                lr=config.lr_fc,
+                weight_decay=config.weight_decay,
+            )
         if config.scheduler == "cos":
             self.scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
@@ -427,47 +476,53 @@ class VPRModule(pl.LightningModule):
         return [self.optimizer]
 
     def training_step(self, batch, batch_idx):
-        # "batch" is the output of the training data loader.
-
-        if self.current_epoch < config.model_freeze_epochs:
-            for param in self.model.model.parameters():
-                param.requires_grad = False
-        else:
-            for param in self.model.model.parameters():
-                param.requires_grad = True
-
-        # if self.current_epoch > -1:
-        #    for param in self.model.fc.parameters():
-        #        param.requires_grad = False
-
         img, labels = batch
-        preds = self.model(img, labels)
-        loss = self.loss_module(preds, labels)
-        acc = (preds.argmax(dim=-1) == labels).float().mean()
-        # Logs the accuracy per epoch to tensorboard (weighted average over batches)
-        self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
+
+        if config.teacher_model_path == "":  # regular training
+            if self.current_epoch < config.model_freeze_epochs:
+                for param in self.model.model.parameters():
+                    param.requires_grad = False
+            else:
+                for param in self.model.model.parameters():
+                    param.requires_grad = True
+
+            # if self.current_epoch > -1:
+            #    for param in self.model.fc.parameters():
+            #        param.requires_grad = False
+
+            preds = self.model(img, labels)
+            loss = self.loss_module(preds, labels)
+            acc = (preds.argmax(dim=-1) == labels).float().mean()
+            # Logs the accuracy per epoch to tensorboard (weighted average over batches)
+            self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
+
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                self.log(
+                    f"lr/lr{i}",
+                    param_group["lr"],
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                )
+
+            if config.dynamic_margin:
+                self.model.fc.update(self.current_epoch)
+
+        else:  # distillation
+            loss = self.model(img, labels)
+
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=False)
-
-        for i, param_group in enumerate(self.optimizer.param_groups):
-            self.log(
-                f"lr/lr{i}",
-                param_group["lr"],
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-            )
-
         if config.scheduler == "cos":
             self.scheduler.step()
-
-        if config.dynamic_margin:
-            self.model.fc.update(self.current_epoch)
 
         return loss  # Return tensor to call ".backward" on
 
     def validation_step(self, batch, batch_idx):
         img, labels = batch
-        preds = self.model(img)
+        if config.teacher_model_path != "":
+            preds = self.model.student(img)
+        else:
+            preds = self.model(img)
         loss = self.loss_module(preds, labels)
         acc = (preds.argmax(dim=-1) == labels).float().mean()
         # By default logs it per epoch (weighted average over batches)
@@ -497,7 +552,7 @@ def main():
     if config.use_val:
         monitor = "val_acc"
     else:
-        monitor = "train_acc"
+        monitor = "train_loss"
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(config.root_dir, "model_saves", config.name),
