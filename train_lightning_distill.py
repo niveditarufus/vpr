@@ -23,45 +23,45 @@ from vit_pytorch.distill import DistillableViT, DistillWrapper
 
 
 class config:
-    name = "vit_224_v10"
+    name = "vit_224_v12"
     root_dir = r"/home/nick/Data/"  # could be '/home/nick/Data/' or '/mnt/data/nick/'
-    csv_file_tr = "train_balance.csv"  # could be 'train.csv' or 'final_data_224/final_data_224.csv'
+    csv_file_tr = (
+        "train.csv"  # could be 'train.csv' or 'final_data_224/final_data_224.csv'
+    )
     csv_file_tt = (
         "test.csv"  # could be 'test.csv' or 'final_data_224/final_data_224.csv'
     )
     dataset = "Product10KDataset"  # could be 'BigDataset' or 'Product10KDataset'
 
     num_models_save = 10
-    lr_model = 2e-7
-    lr_fc = 2e-4
+    lr_model = 2.5e-7
+    lr_fc = 3e-4
     weight_decay = 1e-2
     epochs = 10
     warmup_epochs = 1
     # start_ema_epoch = 5
     model_freeze_epochs = 0
-    teacher_model_path = ""  # "/home/nick/Data/model_saves/epoch=7-step=17736.ckpt"
+    teacher_model_path = "/home/nick/Data/model_saves/epoch=7-step=17736.ckpt"
     start_model_path = ""
     augmentation = True
     dynamic_margin = True
-    m = 0.3
+    m = 0.6
     s = 30
     stride = 0.05
     max_m = 0.8
     batch_size = 32
-    img_size = 256
-    neck = ""  # could be '' or 'option-D'
+    img_size = 224
+    neck = ""  # "option-D"  # could be '' or 'option-D'
     scheduler = "cos"  # could be 'cos' or 'step'
-    model_name = (
-        "convnext_xxlarge"  # could be 'ViT-H-14' or 'ViT-bigG-14' or 'convnext_xxlarge'
-    )
+    model_name = "ViT-H-14"  # could be 'ViT-H-14' or 'ViT-bigG-14'
     num_workers = 12
     num_classes = 9691  # could be '14087' or '9691'
-    embedding_size = 1024  # 1280 or 1024
-    proj = True
+    embedding_size = 1280  # 1280 or 1024
+    proj = False
     precision = 16
     use_val = False
     optimizer = "AdamW"  # could be 'lion' or 'AdamW', 'AdamW_st_tc'
-    loss = "CE"  # could be 'CE' or 'LabelSmoothing'
+    loss = "MSE"  # could be 'CE' or 'LabelSmoothing' or 'MSE'
 
 
 def get_train_aug():
@@ -311,23 +311,18 @@ class Neck(nn.Module):
 
 
 class Classifier_model(nn.Module):
-    def __init__(self):
+    def __init__(self, model_name, proj, neck, fc):
         super(Classifier_model, self).__init__()
-        if config.model_name == "ViT-H-14":
+        if model_name == "ViT-H-14":
             pretrained = "laion2b_s32b_b79k"
-        elif config.model_name == "ViT-bigG-14":
+        elif model_name == "ViT-bigG-14":
             pretrained = "laion2b_s39b_b160k"
-        if config.model_name == "convnext_xxlarge":
-            self.model = open_clip.create_model_and_transforms(
-                "hf-hub:laion/CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup"
-            )[0].visual
-        else:
-            self.model = open_clip.create_model_and_transforms(
-                config.model_name, pretrained=pretrained
-            )[0].visual
-        if not config.proj:
+        self.model = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained
+        )[0].visual
+        if not proj:
             self.model.proj = None
-        if config.neck != "":
+        if neck != "":
             print(
                 "Neck size = ",
                 self.model.state_dict()["proj"].shape[-1],
@@ -338,21 +333,29 @@ class Classifier_model(nn.Module):
                 config.embedding_size,
                 "option-D",
             )
-        self.fc = ArcFace(
-            config.embedding_size,
-            config.num_classes,
-            s=config.s,
-            m=config.m,
-            stride=config.stride,
-            max_m=config.max_m,
-        )
+        else:
+            self.neck = neck
+        if fc != "":
+            self.fc = ArcFace(
+                config.embedding_size,
+                config.num_classes,
+                s=config.s,
+                m=config.m,
+                stride=config.stride,
+                max_m=config.max_m,
+            )
+        else:
+            self.fc = fc
 
     def forward(self, x, labels=None):
-        x = self.model(x)
-        if config.neck != "":
-            x = self.neck(x)
-        x = self.fc(x, labels)
-        return x
+        emb = self.model(x)
+        if self.neck != "":
+            emb = self.neck(emb)
+        if self.fc != "":
+            x = self.fc(emb, labels)
+            return emb, x
+        else:
+            return emb
 
 
 class ModelEmaV2(torch.nn.Module):
@@ -400,40 +403,36 @@ class LabelSmoothingCrossEntropy(nn.Module):
 
 
 def get_student_teacher_distiller():
-    teacher_model = Classifier_model()
+    teacher_model = Classifier_model("ViT-bigG-14", True, neck="", fc="")
     state_dict_model = torch.load(config.teacher_model_path)["state_dict"]
     new_state_dict = OrderedDict()
+    new_state_dict_fc = OrderedDict()
     for k, v in state_dict_model.items():
-        if "model." in k:
+        if "fc.fc" in k:
+            name = k.replace("model.fc.", "")
+            name = name.replace("fc.fc", "fc")
+            new_state_dict_fc[name] = v
+        elif "model." in k:
             name = k.replace("model.", "", 1)
-        new_state_dict[name] = v
+            new_state_dict[name] = v
     teacher_model.load_state_dict(new_state_dict)
-    student_model = DistillableViT(
-        image_size=224,
-        patch_size=14,
-        num_classes=config.num_classes,
-        dim=1024,
-        depth=32,
-        heads=16,
-        mlp_dim=5120,
-        dropout=0.1,
-        emb_dropout=0.1,
-    )
-    distiller = DistillWrapper(
-        student=student_model,
-        teacher=teacher_model,
-        temperature=3,  # temperature of distillation
-        alpha=0.5,  # trade between main loss and distillation loss
-        hard=False,  # whether to use soft or hard distillation
-    )
-    return distiller
+    student_model = Classifier_model("ViT-H-14", True, neck="option-D", fc=True)
+    student_model.fc.load_state_dict(new_state_dict_fc)
+
+    return teacher_model, student_model
 
 
 class VPRModule(pl.LightningModule):
     def __init__(self, num_train_steps):
         super().__init__()
         if config.teacher_model_path != "":
-            self.model = get_student_teacher_distiller()
+            global teacher
+
+            teacher, self.model = get_student_teacher_distiller()
+            teacher.eval().cuda().half()
+
+            for param in teacher.parameters():
+                param.requires_grad = False
         else:
             self.model = Classifier_model()
 
@@ -462,10 +461,12 @@ class VPRModule(pl.LightningModule):
             self.loss_module = nn.CrossEntropyLoss()
         elif config.loss == "LabelSmoothing":
             self.loss_module = LabelSmoothingCrossEntropy()
+        elif config.loss == "MSE":
+            self.loss_module = nn.MSELoss()
         self.num_train_steps = num_train_steps
 
     def forward(self, img, labels):
-        return self.model(img, labels)
+        return self.model(img)
 
     def configure_optimizers(self):
         if config.optimizer == "lion":
@@ -479,6 +480,7 @@ class VPRModule(pl.LightningModule):
         elif config.optimizer == "AdamW":
             params = [
                 {"params": self.model.model.parameters(), "lr": config.lr_model},
+                {"params": self.model.neck.parameters(), "lr": config.lr_fc},
                 {"params": self.model.fc.parameters(), "lr": config.lr_fc},
             ]
             if config.neck != "":
@@ -540,8 +542,21 @@ class VPRModule(pl.LightningModule):
                 self.model.fc.update(self.current_epoch)
 
         else:  # distillation
-            loss = self.model(img, labels)
+            # freeze fc layer that copied from teacher model
+            if self.current_epoch < 3:
+                for param in self.model.fc.parameters():
+                    param.requires_grad = False
+            else:
+                for param in self.model.fc.parameters():
+                    param.requires_grad = True
 
+            output_teacher = teacher(img)
+            emb_student, pred_student = self.model(img, labels)
+            l1 = nn.MSELoss()
+            l2 = nn.CrossEntropyLoss()
+            loss1 = l1(emb_student, output_teacher)
+            loss2 = l2(pred_student, labels)
+            loss = 10 * loss1 + loss2
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=False)
         if config.scheduler == "cos":
             self.scheduler.step()
