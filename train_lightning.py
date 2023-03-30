@@ -21,9 +21,11 @@ from torch.nn import functional as F
 from transformers import get_cosine_schedule_with_warmup
 from vit_pytorch.distill import DistillableViT, DistillWrapper
 
+# from open_clip_280_overlap.src import open_clip
+
 
 class config:
-    name = "vit_224_v10"
+    name = "vit_224_v40"
     root_dir = r"/home/nick/Data/"  # could be '/home/nick/Data/' or '/mnt/data/nick/'
     csv_file_tr = "train_balance.csv"  # could be 'train.csv' or 'final_data_224/final_data_224.csv'
     csv_file_tt = (
@@ -31,32 +33,39 @@ class config:
     )
     dataset = "Product10KDataset"  # could be 'BigDataset' or 'Product10KDataset'
 
-    num_models_save = 10
+    num_models_save = 15
     lr_model = 2e-7
     lr_fc = 2e-4
     weight_decay = 1e-2
-    epochs = 10
+    epochs = 15
     warmup_epochs = 1
     # start_ema_epoch = 5
     model_freeze_epochs = 0
     teacher_model_path = ""  # "/home/nick/Data/model_saves/epoch=7-step=17736.ckpt"
     start_model_path = ""
     augmentation = True
+    color = [
+        0.2,
+        0.3,
+        0.1,
+        0.1,
+        0.3,
+    ]  # brightness=.2, hue=.3, contrast=0, saturation=0, prob=0.5
     dynamic_margin = True
     m = 0.3
     s = 30
     stride = 0.05
     max_m = 0.8
     batch_size = 32
-    img_size = 256
+    img_size = 224
     neck = ""  # could be '' or 'option-D'
     scheduler = "cos"  # could be 'cos' or 'step'
     model_name = (
-        "convnext_xxlarge"  # could be 'ViT-H-14' or 'ViT-bigG-14' or 'convnext_xxlarge'
+        "ViT-H-14"  # could be 'ViT-H-14' or 'ViT-bigG-14' or 'convnext_xxlarge'
     )
     num_workers = 12
     num_classes = 9691  # could be '14087' or '9691'
-    embedding_size = 1024  # 1280 or 1024
+    embedding_size = 1024  # 1024  # 1280 or 1024
     proj = True
     precision = 16
     use_val = False
@@ -69,21 +78,26 @@ def get_train_aug():
         train_augs = tv.transforms.Compose(
             [
                 tv.transforms.Resize((config.img_size, config.img_size)),
-                # tv.transforms.RandomResizedCrop((config.img_size, config.img_size)),
-                tv.transforms.RandomVerticalFlip(),
+                # tv.transforms.RandomResizedCrop((config.img_size, config.img_size), scale=(0.6, 1.0)),
+                # tv.transforms.RandomVerticalFlip(),
                 tv.transforms.RandomHorizontalFlip(),
-                tv.transforms.RandomApply(
-                    [tv.transforms.RandomRotation(degrees=90)], p=0.3
-                ),
+                # tv.transforms.RandomApply(
+                #    [tv.transforms.RandomRotation(degrees=90)], p=0.3
+                # ),
                 tv.transforms.RandomApply(
                     [
-                        tv.transforms.ColorJitter(brightness=0.2, hue=0.3),
+                        tv.transforms.ColorJitter(
+                            brightness=config.color[0],
+                            hue=config.color[1],
+                            contrast=config.color[2],
+                            saturation=config.color[3],
+                        ),
                     ],
-                    p=0.2,
+                    p=config.color[-1],
                 ),
                 # tv.transforms.RandomApply([tv.transforms.RandAugment()], p=0.3),
                 tv.transforms.ToTensor(),
-                # tv.transforms.RandomErasing(p=0.3, scale=(0.05, 0.2), ratio=(0.3, 3.3)),
+                # tv.transforms.RandomErasing(p=0.3, scale=(0.05, 0.3), ratio=(0.3, 3.3)),
                 # tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
                 tv.transforms.Normalize(
                     mean=[0.48145466, 0.4578275, 0.40821073],
@@ -95,10 +109,8 @@ def get_train_aug():
         train_augs = tv.transforms.Compose(
             [
                 tv.transforms.Resize((config.img_size, config.img_size)),
-                tv.transforms.RandomVerticalFlip(),
                 tv.transforms.RandomHorizontalFlip(),
                 tv.transforms.ToTensor(),
-                # tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
                 tv.transforms.Normalize(
                     mean=[0.48145466, 0.4578275, 0.40821073],
                     std=[0.26862954, 0.26130258, 0.27577711],
@@ -323,7 +335,9 @@ class Classifier_model(nn.Module):
             )[0].visual
         else:
             self.model = open_clip.create_model_and_transforms(
-                config.model_name, pretrained=pretrained
+                config.model_name,
+                pretrained=pretrained
+                # "ViT-H-14-252", pretrained=pretrained
             )[0].visual
         if not config.proj:
             self.model.proj = None
