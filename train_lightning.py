@@ -33,11 +33,11 @@ class config:
     )
     dataset = "Product10KDataset"  # could be 'BigDataset' or 'Product10KDataset'
 
-    num_models_save = 15
+    num_models_save = 10
     lr_model = 2e-7
     lr_fc = 2e-4
     weight_decay = 1e-2
-    epochs = 15
+    epochs = 10
     warmup_epochs = 1
     # start_ema_epoch = 5
     model_freeze_epochs = 0
