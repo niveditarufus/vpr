@@ -7,6 +7,9 @@ To begin training, prepare the dataset as described above, update all path varia
 
 ```python train_lightning.py ```
 
+As the best weights for the model, in our settings it was epoch=6-step=54502.ckpt.
+
+
 # Some useful links:
 * [https://www.kaggle.com/competitions/products-10k/discussion/188026](https://www.kaggle.com/competitions/products-10k/discussion/188026)
 * [https://www.kaggle.com/competitions/google-universal-image-embedding/discussion/359316](https://www.kaggle.com/competitions/google-universal-image-embedding/discussion/359316)
