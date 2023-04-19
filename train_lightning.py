@@ -21,21 +21,19 @@ from torch.nn import functional as F
 from transformers import get_cosine_schedule_with_warmup
 from vit_pytorch.distill import DistillableViT, DistillWrapper
 
-# from open_clip_280_overlap.src import open_clip
-
 
 class config:
-    name = "vit_224_v40"
+    name = "vit_224_v42"
     root_dir = r"/home/nick/Data/"  # could be '/home/nick/Data/' or '/mnt/data/nick/'
-    csv_file_tr = "train_balance.csv"  # could be 'train.csv' or 'final_data_224/final_data_224.csv'
+    csv_file_tr = "train_balance_union.csv"  # could be 'train.csv' or 'final_data_224/final_data_224.csv'
     csv_file_tt = (
         "test.csv"  # could be 'test.csv' or 'final_data_224/final_data_224.csv'
     )
     dataset = "Product10KDataset"  # could be 'BigDataset' or 'Product10KDataset'
 
     num_models_save = 10
-    lr_model = 2e-7
-    lr_fc = 2e-4
+    lr_model = 3e-7
+    lr_fc = 3e-4
     weight_decay = 1e-2
     epochs = 10
     warmup_epochs = 1
@@ -64,7 +62,7 @@ class config:
         "ViT-H-14"  # could be 'ViT-H-14' or 'ViT-bigG-14' or 'convnext_xxlarge'
     )
     num_workers = 12
-    num_classes = 9691  # could be '14087' or '9691'
+    num_classes = 10300  # could be '14087' or '9691'
     embedding_size = 1024  # 1024  # 1280 or 1024
     proj = True
     precision = 16
